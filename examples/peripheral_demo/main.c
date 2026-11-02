@@ -1,0 +1,372 @@
+/* SPDX-License-Identifier: MIT */
+
+#include <stdint.h>
+#include <string.h>
+
+#include "app_error.h"
+#include "app_timer.h"
+#include "boards.h"
+#include "nrf.h"
+#include "usb_log.h"
+#include "nrf_ble.h"
+#include "nrf_drv_clock.h"
+
+APP_TIMER_DEF(m_measurement_timer_id);
+
+#define BLE_ADV_LED_IDX BSP_BOARD_LED_0
+#if (LEDS_NUMBER > 1)
+#define BLE_CONNECTED_LED_IDX BSP_BOARD_LED_3
+#else
+#define BLE_CONNECTED_LED_IDX BSP_BOARD_LED_0
+#endif
+
+static void counter_char_evt_handler(const ble_gatt_char_evt_t *p_evt);
+static void text_char_evt_handler(const ble_gatt_char_evt_t *p_evt);
+static void gap_evt_handler(const ble_gap_evt_t *p_evt);
+static void gatt_server_evt_handler(const ble_gatt_server_evt_t *p_evt);
+static void ble_state_set(bool connected);
+static void start_advertising(void);
+static void clock_init(void);
+static uint32_t timer_ticks_clamped(uint32_t ms);
+static const char *ble_phy_name(uint8_t phy);
+
+static const char m_dev_name[] = "nRF-BLE-Custom-Stack";
+static uint8_t m_counter_char_value;
+static char m_text_char_value[BLE_ATT_MAX_VALUE_LEN] = "";
+static const uint8_t m_custom_uuid_base[BLE_UUID128_LEN] = {
+    0x52U,
+    0xD0U,
+    0x4FU,
+    0x36U,
+    0x7EU,
+    0x85U,
+    0x74U,
+    0x1CU,
+    0xA6U,
+    0x8FU,
+    0x4EU,
+    0x7AU,
+    0x00U,
+    0x00U,
+    0x00U,
+    0x00U,
+};
+static const ble_uuid_t m_custom_service_uuid = BLE_UUID_VENDOR16_INIT(0xFFF0U);
+static const int8_t m_adv_tx_power = 0x08;
+static const ble_gap_adv_service_uuid_list_config_t m_adv_service_uuid_lists[] = {
+    {
+        .type = BLE_GAP_ADV_SERVICE_UUID_LIST_COMPLETE_128,
+        .p_uuids = &m_custom_service_uuid,
+        .uuid_count = 1U,
+    },
+};
+static const ble_gap_adv_name_config_t m_adv_name = {
+    .name_type = BLE_GAP_ADV_NAME_SHORT,
+    .short_name_length = 4U,
+};
+static const ble_gap_adv_name_config_t m_scan_response_name = {
+    .name_type = BLE_GAP_ADV_NAME_FULL,
+};
+static const uint8_t m_adv_service_data[] = {
+    0x01U,
+    0x00U,
+};
+static const uint8_t m_adv_manufacturer_data[] = {
+    0x10U,
+    0x01U,
+    0x00U,
+    0x00U,
+};
+static const ble_gap_adv_service_data_t m_service_data = {
+    .uuid = BLE_UUID_VENDOR16_INIT(0xFFF0U),
+    .p_data = m_adv_service_data,
+    .data_len = sizeof(m_adv_service_data),
+};
+static const ble_gap_adv_manufacturer_data_t m_manufacturer_data = {
+    .company_id = 0x0059U,
+    .p_data = m_adv_manufacturer_data,
+    .data_len = sizeof(m_adv_manufacturer_data),
+};
+static const ble_gap_conn_params_t m_gap_conn_params = {
+    .min_conn_interval_1p25ms = MS_TO_1P25MS_UNITS(30U),
+    .max_conn_interval_1p25ms = MS_TO_1P25MS_UNITS(30U),
+    .slave_latency = 0U,
+    .supervision_timeout_10ms = MS_TO_10MS_UNITS(1500U),
+};
+static const ble_gap_adv_config_t m_adv_config = {
+    .flags = (uint8_t)(BLE_GAP_ADV_FLAG_LE_GENERAL_DISC_MODE |
+                       BLE_GAP_ADV_FLAG_BR_EDR_NOT_SUPPORTED),
+    .interval_ms = 100U,
+    .adv_type = BLE_GAP_ADV_TYPE_CONNECTABLE_SCANNABLE_UNDIRECTED,
+    .adv_data = {
+        .p_name = &m_adv_name,
+        .p_tx_power = &m_adv_tx_power,
+        .p_service_uuid_lists = m_adv_service_uuid_lists,
+        .service_uuid_list_count = 1U,
+    },
+    .scan_response_data = {
+        .p_name = &m_scan_response_name,
+        .p_service_data = &m_service_data,
+        .p_manufacturer_data = &m_manufacturer_data,
+    },
+};
+
+static ble_gatt_characteristic_t m_custom_characteristics[] = {
+    {
+        .uuid = BLE_UUID_VENDOR16_INIT(0xFFF1U),
+        .properties = (uint8_t)(BLE_GATT_CHAR_PROP_READ | BLE_GATT_CHAR_PROP_NOTIFY | BLE_GATT_CHAR_PROP_INDICATE),
+        .p_value = &m_counter_char_value,
+        .value_len = sizeof(m_counter_char_value),
+        .max_len = sizeof(m_counter_char_value),
+        .evt_handler = counter_char_evt_handler,
+        .value_handle = 0U,
+        .cccd_handle = 0U,
+    },
+    {
+        .uuid = BLE_UUID_VENDOR16_INIT(0xFFF2U),
+        .properties = (uint8_t)(BLE_GATT_CHAR_PROP_READ |
+                                BLE_GATT_CHAR_PROP_WRITE |
+                                BLE_GATT_CHAR_PROP_WRITE_NO_RESP),
+        .p_value = (uint8_t *)m_text_char_value,
+        .value_len = 0U,
+        .max_len = sizeof(m_text_char_value),
+        .evt_handler = text_char_evt_handler,
+        .value_handle = 0U,
+        .cccd_handle = 0U,
+    },
+};
+
+static ble_gatt_service_t m_custom_services[] = {
+    {
+        .uuid = BLE_UUID_VENDOR16_INIT(0xFFF0U),
+        .p_characteristics = m_custom_characteristics,
+        .characteristic_count = (uint8_t)(sizeof(m_custom_characteristics) / sizeof(m_custom_characteristics[0])),
+        .service_handle = 0U,
+    },
+};
+
+static void clock_init(void)
+{
+  ret_code_t err;
+
+  if (!nrf_drv_clock_init_check())
+  {
+    err = nrf_drv_clock_init();
+    if ((err != NRF_SUCCESS) && (err != NRF_ERROR_MODULE_ALREADY_INITIALIZED))
+    {
+      APP_ERROR_CHECK(err);
+    }
+  }
+
+  nrf_drv_clock_lfclk_request(NULL);
+  while (!nrf_drv_clock_lfclk_is_running())
+  {
+  }
+
+  nrf_drv_clock_hfclk_request(NULL);
+  while (!nrf_drv_clock_hfclk_is_running())
+  {
+  }
+}
+
+static void ble_state_set(bool connected)
+{
+  if (connected)
+  {
+    bsp_board_led_off(BLE_ADV_LED_IDX);
+    bsp_board_led_on(BLE_CONNECTED_LED_IDX);
+    return;
+  }
+
+  bsp_board_led_on(BLE_ADV_LED_IDX);
+  bsp_board_led_off(BLE_CONNECTED_LED_IDX);
+}
+
+static void start_advertising(void)
+{
+  ble_state_set(false);
+  ble_gap_start_advertising();
+  log_printf("BLE advertising started\n");
+}
+
+static uint32_t timer_ticks_clamped(uint32_t ms)
+{
+  uint32_t ticks = APP_TIMER_TICKS(ms);
+
+  return (ticks < APP_TIMER_MIN_TIMEOUT_TICKS) ? APP_TIMER_MIN_TIMEOUT_TICKS : ticks;
+}
+
+static const char *ble_phy_name(uint8_t phy)
+{
+  switch (phy)
+  {
+  case BLE_GAP_PHY_1MBPS:
+    return "1M";
+
+  case BLE_GAP_PHY_2MBPS:
+    return "2M";
+
+  default:
+    return "unknown";
+  }
+}
+
+static void measurement_timer_handler(void *p_context)
+{
+  (void)p_context;
+
+  if (!ble_gap_is_connected())
+  {
+    return;
+  }
+
+  m_counter_char_value++;
+  if (ble_gatt_server_indicate_characteristic(&m_custom_characteristics[0]))
+  {
+    log_printf("BLE GATT: indicated counter=%u\n", (unsigned int)m_counter_char_value);
+    return;
+  }
+
+  if (ble_gatt_server_notify_characteristic(&m_custom_characteristics[0]))
+  {
+    log_printf("BLE GATT: notified counter=%u\n", (unsigned int)m_counter_char_value);
+  }
+}
+
+static void gap_evt_handler(const ble_gap_evt_t *p_evt)
+{
+  if (p_evt == NULL)
+  {
+    return;
+  }
+
+  switch (p_evt->evt_type)
+  {
+  case BLE_GAP_EVT_SUPERVISION_TIMEOUT:
+    log_printf("BLE LINK: supervision timeout\n");
+    return;
+
+  case BLE_GAP_EVT_CONN_UPDATE_IND:
+    log_printf("BLE GAP: connection updated, interval=%d ms latency=%d timeout=%d ms\n",
+               (int)p_evt->params.conn_interval_ms,
+               (int)p_evt->params.slave_latency,
+               (int)p_evt->params.supervision_timeout_ms);
+    return;
+
+  case BLE_GAP_EVT_PHY_UPDATE_IND:
+    log_printf("BLE GAP: PHY updated, tx=%s rx=%s\n",
+               ble_phy_name(p_evt->params.tx_phy),
+               ble_phy_name(p_evt->params.rx_phy));
+    return;
+
+  case BLE_GAP_EVT_TERMINATE_IND:
+    log_printf("BLE LINK: terminate indication received\n");
+    return;
+
+  case BLE_GAP_EVT_CONNECTED:
+    m_counter_char_value = 0U;
+    m_custom_characteristics[0].value_len = sizeof(m_counter_char_value);
+    ble_state_set(true);
+    APP_ERROR_CHECK(app_timer_start(m_measurement_timer_id, timer_ticks_clamped(1000U), NULL));
+    log_printf("BLE GAP: connected, interval=%d ms timeout=%d ms\n",
+               (int)p_evt->params.conn_interval_ms,
+               (int)p_evt->params.supervision_timeout_ms);
+    return;
+
+  case BLE_GAP_EVT_DISCONNECTED:
+    APP_ERROR_CHECK(app_timer_stop(m_measurement_timer_id));
+    log_printf("BLE GAP: disconnected\n");
+    start_advertising();
+    return;
+
+  default:
+    return;
+  }
+}
+
+static void gatt_server_evt_handler(const ble_gatt_server_evt_t *p_evt)
+{
+  if ((p_evt == NULL) || (p_evt->evt_type != BLE_GATT_SERVER_EVT_MTU_EXCHANGE))
+  {
+    return;
+  }
+
+  log_printf("BLE ATT: MTU exchange req=%u rsp=%u effective=%u\n",
+             (unsigned int)p_evt->params.requested_mtu,
+             (unsigned int)p_evt->params.response_mtu,
+             (unsigned int)p_evt->params.effective_mtu);
+}
+
+static void counter_char_evt_handler(const ble_gatt_char_evt_t *p_evt)
+{
+  if (p_evt == NULL)
+  {
+    return;
+  }
+
+  if ((p_evt->evt_type == BLE_GATT_CHAR_EVT_NOTIFY_ENABLED) ||
+      (p_evt->evt_type == BLE_GATT_CHAR_EVT_NOTIFY_DISABLED))
+  {
+    log_printf("BLE GATT: counter notifications %s\n", p_evt->notifications_enabled ? "enabled" : "disabled");
+    return;
+  }
+
+  if ((p_evt->evt_type == BLE_GATT_CHAR_EVT_INDICATE_ENABLED) ||
+      (p_evt->evt_type == BLE_GATT_CHAR_EVT_INDICATE_DISABLED))
+  {
+    log_printf("BLE GATT: counter indications %s\n", p_evt->indications_enabled ? "enabled" : "disabled");
+  }
+}
+
+static void text_char_evt_handler(const ble_gatt_char_evt_t *p_evt)
+{
+  char written_text[BLE_ATT_MAX_VALUE_LEN + 1U];
+  uint16_t copy_len;
+
+  if ((p_evt == NULL) || (p_evt->evt_type != BLE_GATT_CHAR_EVT_WRITE))
+  {
+    return;
+  }
+
+  copy_len = p_evt->p_characteristic->value_len;
+  if (copy_len > BLE_ATT_MAX_VALUE_LEN)
+  {
+    copy_len = BLE_ATT_MAX_VALUE_LEN;
+  }
+
+  if ((copy_len > 0U) && (p_evt->p_characteristic->p_value != NULL))
+  {
+    (void)memcpy(written_text, p_evt->p_characteristic->p_value, copy_len);
+  }
+  written_text[copy_len] = '\0';
+
+  log_printf("BLE GATT: write text=\"%s\"\n", written_text);
+}
+
+int main(void)
+{
+  bsp_board_init(BSP_INIT_LEDS);
+  clock_init();
+  log_init();
+
+  ble_stack_init(BLE_GAP_ROLE_PERIPHERAL);
+  ble_gap_register_evt_handler(gap_evt_handler);
+  ble_gatt_server_register_evt_handler(gatt_server_evt_handler);
+  ble_gap_set_device_name(m_dev_name);
+  ble_gap_set_conn_params(&m_gap_conn_params);
+  ble_uuid_set_vendor_base(m_custom_uuid_base);
+  APP_ERROR_CHECK_BOOL(ble_gap_adv_init(&m_adv_config));
+  APP_ERROR_CHECK_BOOL(ble_gatt_server_init(m_custom_services,
+                                            (uint8_t)(sizeof(m_custom_services) / sizeof(m_custom_services[0]))));
+
+  APP_ERROR_CHECK(app_timer_create(&m_measurement_timer_id,
+                                   APP_TIMER_MODE_REPEATED,
+                                   measurement_timer_handler));
+
+  start_advertising();
+
+  while (1)
+  {
+    __WFE();
+  }
+}

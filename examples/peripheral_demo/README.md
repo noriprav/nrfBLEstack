@@ -1,0 +1,33 @@
+<!-- SPDX-License-Identifier: MIT -->
+
+# peripheral_demo
+
+Example BLE peripheral application for `nrf-ble-stack`.
+
+This example:
+
+- initializes the stack
+- configures GAP advertising and device name
+- registers a custom GATT service with a counter characteristic and a text characteristic
+- advertises the custom service UUID from a complete 128-bit service UUID list
+- places service data and manufacturer-specific data in the scan response
+- sends periodic notifications or indications while connected
+- logs GAP and GATT activity over USB CDC ACM
+
+## Requirements
+
+- `external/nrf5-sdk` submodule initialized
+- GNU Arm Embedded toolchain
+- `make`
+
+## Build
+
+```sh
+git submodule update --init --recursive
+make -C examples/peripheral_demo -j4
+```
+
+## Notes
+
+- The example uses the stack directly from the repository root through `BLE_STACK_DIR := ../..`.
+- The small `support/usb_log` module is included locally in this example so the build does not depend on machine-specific paths.
